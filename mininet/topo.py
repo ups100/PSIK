@@ -23,25 +23,25 @@ def vid_mac2dpid(vid, mac):
                         'please either specify a dpid or use a '
                         'canonical switch name such as s23.' )
 
-def add_clients(nclients, parent, parent_mac, net):
+def add_clients(nclients, parent, parent_mac, dns_ip, net):
     for client in range(nclients):
        cli_name = 'c' + str(client + 1)
        cli_ip = '10.1.0.' + str(client + 1)
        cli_netmask = '255.0.0.0'
        cli_mac = parent_mac[:-2] + hex(client + 1)[2:].zfill(2)
-       cli = net.addHost(cli_name, ip=cli_ip, netmask=cli_netmask, mac=cli_mac)
+       cli = net.addHost(cli_name, ip=cli_ip, netmask=cli_netmask, mac=cli_mac, dns=dns_ip)
        net.addLink(parent, cli)
 
-def add_data_center(nservers, data_center, parent, parent_mac, net):
+def add_data_center(nservers, data_center, parent, parent_mac, dns_ip, net):
     for server in range(nservers):
        srv_name = 'dc' + str(data_center) + 'h' + str(server + 1)
        srv_ip = '10.0.' + str(data_center) + '.' + str(server + 1)
        srv_netmask = '255.0.0.0'
        srv_mac = parent_mac[:-2] + hex(server + 1)[2:].zfill(2)
-       srv = net.addHost(srv_name, ip=srv_ip, netmask=srv_netmask, mac=srv_mac);
+       srv = net.addHost(srv_name, ip=srv_ip, netmask=srv_netmask, mac=srv_mac, dns=dns_ip);
        net.addLink(parent, srv);
       
-def add_data_centers(data_centers, parent, parent_mac, net):
+def add_data_centers(data_centers, parent, parent_mac, dns, net):
     for data_center in range(len(data_centers)):
        # data center switch
        switch_name = 'dcs' + str(data_center + 1)
@@ -51,7 +51,7 @@ def add_data_centers(data_centers, parent, parent_mac, net):
        print "Data center " + str(data_center) + " dpid: " + dc_dpid
        dcs = net.addSwitch(switch_name, dpid=dc_dpid);
        net.addLink(parent, dcs)
-       add_data_center(data_centers[data_center], data_center + 1, dcs, mac, net)
+       add_data_center(data_centers[data_center], data_center + 1, dcs, mac, dns, net)
 
 def create_network(nclients, data_centers):
     net = Mininet()
@@ -71,8 +71,9 @@ def create_network(nclients, data_centers):
     # and link between them
     net.addLink(mcs, mss)
 
-    add_data_centers(data_centers, mss, mss_mac, net)
-    add_clients(nclients, mcs, mcs_mac, net)
+    dns = "10.254.254.254"
+    add_data_centers(data_centers, mss, mss_mac, dns, net)
+    add_clients(nclients, mcs, mcs_mac, dns, net)
 
     return net
 
