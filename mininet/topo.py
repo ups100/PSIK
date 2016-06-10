@@ -1,56 +1,78 @@
 #!/usr/bin/python
 
 from mininet.net import Mininet
-from mininet.node import Controller
+from mininet.node import Controller, RemoteController
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
 
 import sys, getopt
+import socket
 
-def int2dpid( dpid ):
+def vid_mac2dpid(vid, mac):
    try:
-      dpid = hex( dpid )[ 2: ]
-      dpid = '0' * ( 16 - len( dpid ) ) + dpid
+      mac_hex = mac.replace(":", "")
+      vid_hex = hex(vid)[2:]
+
+      if len(vid_hex) > 4:
+         raise Exception('VID too long')
+
+      dpid = '0' * (4 - len(vid_hex)) + vid_hex + '0' * (12 - len(mac_hex)) + mac_hex
       return dpid
    except IndexError:
-      raise Exception( 'Unable to derive default datapath ID - '
-                       'please either specify a dpid or use a '
-               'canonical switch name such as s23.' )
+       raise Exception( 'Unable to derive default datapath ID - '
+                        'please either specify a dpid or use a '
+                        'canonical switch name such as s23.' )
 
-def add_clients(nclients, parent, net):
+def add_clients(nclients, parent, parent_mac, net):
     for client in range(nclients):
-        cli_name = 'c' + str(client + 1)
-        cli_ip = '20.0.0.' + str(client + 1)
-        cli = net.addHost(cli_name, ip=cli_ip)
-        net.addLink(parent, cli)
+       cli_name = 'c' + str(client + 1)
+       cli_ip = '10.1.0.' + str(client + 1)
+       cli_netmask = '255.0.0.0'
+       cli_mac = parent_mac[:-2] + hex(client + 1)[2:].zfill(2)
+       cli = net.addHost(cli_name, ip=cli_ip, netmask=cli_netmask, mac=cli_mac)
+       net.addLink(parent, cli)
 
-def add_data_center(nservers, data_center, parent, net):
+def add_data_center(nservers, data_center, parent, parent_mac, net):
     for server in range(nservers):
-        srv_name = 'dc' + str(data_center) + 'h' + str(server + 1)
-        srv_ip = '10.0.' + str(data_center) + '.' + str(server + 1)
-        srv = net.addHost(srv_name, ip=srv_ip);
-        net.addLink(parent, srv);
-        
-def add_data_centers(data_centers, parent, net):
+       srv_name = 'dc' + str(data_center) + 'h' + str(server + 1)
+       srv_ip = '10.0.' + str(data_center) + '.' + str(server + 1)
+       srv_netmask = '255.0.0.0'
+       srv_mac = parent_mac[:-2] + hex(server + 1)[2:].zfill(2)
+       srv = net.addHost(srv_name, ip=srv_ip, netmask=srv_netmask, mac=srv_mac);
+       net.addLink(parent, srv);
+      
+def add_data_centers(data_centers, parent, parent_mac, net):
     for data_center in range(len(data_centers)):
-        # data center switch
-        switch_name = 'dcs' + str(data_center + 1)
-        dcs = net.addSwitch(switch_name, dpid=int2dpid(100 + data_center + 1));
-        net.addLink(parent, dcs)
-        add_data_center(data_centers[data_center], data_center + 1, dcs, net)
+       # data center switch
+       switch_name = 'dcs' + str(data_center + 1)
+       mac = parent_mac[:-5] +  hex(data_center + 1)[2:].zfill(2) + ":00"
+       vid = 100 + data_center + 1
+       dc_dpid = vid_mac2dpid(vid, mac) 
+       print "Data center " + str(data_center) + " dpid: " + dc_dpid
+       dcs = net.addSwitch(switch_name, dpid=dc_dpid);
+       net.addLink(parent, dcs)
+       add_data_center(data_centers[data_center], data_center + 1, dcs, mac, net)
 
 def create_network(nclients, data_centers):
     net = Mininet()
 
     # add main servers switch
-    mss = net.addSwitch('mss', dpid=int2dpid(1))
+    mss_mac = "00:00:00:01:00:00"
+    vid = 1
+    switch_dpid = vid_mac2dpid(vid, mss_mac)
+    print "MSS dpid: " + switch_dpid
+    mss = net.addSwitch('mss', dpid=switch_dpid)
     # add main client Switch
-    mcs = net.addSwitch('mcs', dpid=int2dpid(2))
+    mcs_mac = "00:00:00:02:00:00"
+    vid = 2
+    switch_dpid = vid_mac2dpid(vid, mcs_mac)
+    print "MCS dpid: " + switch_dpid
+    mcs = net.addSwitch('mcs', dpid=switch_dpid)
     # and link between them
     net.addLink(mcs, mss)
 
-    add_data_centers(data_centers, mss, net)
-    add_clients(nclients, mcs, net)
+    add_data_centers(data_centers, mss, mss_mac, net)
+    add_clients(nclients, mcs, mcs_mac, net)
 
     return net
 
@@ -96,6 +118,10 @@ def main(argv):
     print "Data centers: ", data_centers
 
     network = create_network(n_clients, data_centers)
+
+    ctrl_host = "pox-machine"
+    ctrl_ip = socket.gethostbyname(ctrl_host)
+    ctrl = network.addController('c0', controller=RemoteController, ip=ctrl_ip, port=6633)
 
     run_network(network)
 
