@@ -26,21 +26,86 @@ class DecisionType:
 
 log = core.getLogger()
 
-class PSIKComponent (object):
-    class PSIKSwitch:
-        def __init__(self, sid, dpid, connection = None):
-            self.name = sid
-            self.dpid = dpid
-            self.connection = connection
+class PSIKSwitch(object):
+    def __init__(self, sid, dpid, connection = None):
+        self.name = sid
+        self.dpid = dpid
+        self.connection = connection
 
+    def set_connection(self, connection):
+        self.connection = connection
+        connection.addListeners(self)
+
+class PSIKLearningSwitch(PSIKSwitch):
+    def __init__(self, sid, dpid, connection = None):
+        super(PSIKLearningSwitch, self).__init__(sid, dpid, connection)
+        self.macToPort = {}
+
+    def _handle_PacketIn(self, event):
+        packet = event.parsed
+
+        def flood():
+            msg = of.ofp_packet_out()
+            msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD))
+            msg.data = event.ofp
+            msg.in_port = event.port
+            self.connection.send(msg)
+
+        def drop(duration = None):
+            msg = None
+            if duration is not None:
+                if not isinstance(duration, tuple):
+                    duration = (duration,duration)
+                msg = of.ofp_flow_mod()
+                msg.match = of.ofp_match.from_packet(packet)
+                msg.idle_timeout = duration[0]
+                msg.hard_timeout = duration[1]
+                msg.buffer_id = event.ofp.buffer_id
+            elif event.ofp.buffer_id is not None:
+                msg = of.ofp_packet_out()
+                msg.buffer_id = event.ofp.buffer_id
+                msg.in_port = event.port
+
+            self.connection.send(msg)
+
+        #here function really starts
+        self.macToPort[packet.src] = event.port
+
+        if packet.dst.is_multicast:
+            flood()
+        elif packet.dst not in self.macToPort:
+            log.debug("Route to %s not found flooding" % (packet.dst,))
+            flood()
+        else:
+            port = self.macToPort[packet.dst]
+            if port == event.port:
+                log.warning("Same port for packet from %s -> %s on %s.%s.  Drop."
+                            % (packet.src, packet.dst, dpid_to_str(event.dpid), port))
+                drop(10)
+                return
+
+        log.debug("installing flow for %s.%i -> %s.%i" %
+                  (packet.src, event.port, packet.dst, port))
+        msg = of.ofp_flow_mod()
+        msg.match = of.ofp_match.from_packet(packet, event.port)
+        msg.idle_timeout = 10
+        msg.hard_timeout = 30
+        msg.actions.append(of.ofp_action_output(port = port))
+        msg.data = event.ofp
+        self.connection.send(msg)
+
+            
+
+
+class PSIKComponent (object):
     def __init__(self, mss_dpid, mcs_dpid, dcs_dpids, decision_type, dcs_load):
         self.switches = set()
-        self.mcs = self.PSIKSwitch("mcs", mcs_dpid)
-        self.mss = self.PSIKSwitch("mss", mss_dpid)
+        self.mcs = PSIKLearningSwitch("mcs", mcs_dpid)
+        self.mss = PSIKLearningSwitch("mss", mss_dpid)
         self.dcs = list()
         i = 1
         for dpid in dcs_dpids:
-            self.dcs.append(self.PSIKSwitch("dc" + str(i), dpid))
+            self.dcs.append(PSIKLearningSwitch("dc" + str(i), dpid))
             i += 1
 
         core.openflow.addListeners(self)
@@ -51,17 +116,17 @@ class PSIKComponent (object):
         dpid = event.connection.dpid
         if dpid == self.mss.dpid:
             log.debug("Main server switch found: %s" % (event.connection,))
-            self.mss.connection = event.connection
+            self.mss.set_connection(event.connection)
         elif dpid == self.mcs.dpid:
             log.debug("Main client switch found: %s" % (event.connection,))
-            self.mcs.connection = event.connection
+            self.mcs.set_connection(event.connection)
         else:
             found = False
             for switch in self.dcs:
                 if switch.dpid == dpid:
                     found = True
                     log.debug("%s switch found: %s" % (switch.name, event.connection,))
-                    switch.connection = event.connection
+                    switch.set_connection(event.connection)
             if not found:
                 log.error("Unable to identify switch: %s" % (event.connection,))
 
