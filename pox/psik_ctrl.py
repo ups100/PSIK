@@ -151,10 +151,11 @@ class PSIKARPVisibleSwitch(PSIKLearningSwitch):
 
 
 class PSIKMainServerSwitch(PSIKARPVisibleSwitch):
-    def __init__(self, sid, dpid, ip, dcs_load, connection = None):
+    def __init__(self, sid, dpid, ip, dcs_load, srv_loads,  connection = None):
         super(PSIKMainServerSwitch, self).__init__(sid, dpid, ip, connection)
         self.service_name = "service.psik.com"
         self.dcs_load = dcs_load
+        self.srv_loads = srv_loads
 
     def set_connection(self, connection):
         msg = of.ofp_flow_mod()
@@ -166,24 +167,23 @@ class PSIKMainServerSwitch(PSIKARPVisibleSwitch):
         connection.send(msg)
         super(PSIKMainServerSwitch, self).set_connection(connection)
 
-    def _choose_data_center(self):
-        def weighted_host_choice():
-            print "Load " + str(self.dcs_load)
-            total = sum(self.dcs_load)
+    def _choose_server(self):
+        def weighted_host_choice(weights):
+            total = sum(weights)
             r = random.uniform(0, total)
 
             upto = 0
             i = 0
-            for load in self.dcs_load:
+            for load in weights:
                 if upto + load >= r:
                     return i;
                 upto += load
                 i += 1
             assert False, "Shouldn't get here"
 
-        dc = weighted_host_choice() + 1
-        ip_str = "10.0." + str(dc) + ".1"
-
+        dc = weighted_host_choice(self.dcs_load)
+        srv = weighted_host_choice(self.srv_loads[dc])
+        ip_str = "10.0." + str(dc + 1) + "." + str(srv + 1)
         return IPAddr(ip_str)
 
     def _send_ip_packet(self, protocol, dstip, dsthw, payload, _out_port):
@@ -230,7 +230,7 @@ class PSIKMainServerSwitch(PSIKARPVisibleSwitch):
         if question.qtype == dns.rr.A_TYPE and question.name == self.service_name:
             # Some one is asking about our service so let's
             # choose one of data centers and answer him
-            dc_ip = self._choose_data_center()
+            dc_ip = self._choose_server()
             response = dns.rr(question.name, question.qtype, question.qclass,
                               0, 4, dc_ip)
         elif question.qtype == dns.rr.PTR_TYPE:
@@ -258,16 +258,14 @@ class PSIKMainServerSwitch(PSIKARPVisibleSwitch):
 
 class PSIKComponent (object):
     def __init__(self, mss_dpid, mss_ip, mcs_dpid, dcs_dpids, decision_type, dcs_load):
-        self.switches = set()
         self.mcs = PSIKLearningSwitch("mcs", mcs_dpid)
         self.dcs_load = [float(load[0]) for load in dcs_load]
-        self.mss = PSIKMainServerSwitch("mss", mss_dpid, mss_ip, self.dcs_load)
+        self.srv_loads = [load[1] for load in dcs_load]
+        self.mss = PSIKMainServerSwitch("mss", mss_dpid, mss_ip, self.dcs_load, self.srv_loads)
         print "Data centers loads: " + str(self.dcs_load)
         self.dcs = list()
         i = 1
         for dpid in dcs_dpids:
-            s_loads = dcs_load[i - 1][1]
-            print s_loads
             self.dcs.append(PSIKLearningSwitch("dc" + str(i), dpid))
             i += 1
 
