@@ -168,7 +168,8 @@ class PSIKMainServerSwitch(PSIKARPVisibleSwitch):
 
     def _choose_data_center(self):
         def weighted_host_choice():
-            total = sum(load for load in self.dcs_load)
+            print "Load " + str(self.dcs_load)
+            total = sum(self.dcs_load)
             r = random.uniform(0, total)
 
             upto = 0
@@ -259,11 +260,14 @@ class PSIKComponent (object):
     def __init__(self, mss_dpid, mss_ip, mcs_dpid, dcs_dpids, decision_type, dcs_load):
         self.switches = set()
         self.mcs = PSIKLearningSwitch("mcs", mcs_dpid)
-        self.mss = PSIKMainServerSwitch("mss", mss_dpid, mss_ip, dcs_load)
-        self.dcs_load = dcs_load
+        self.dcs_load = [float(load[0]) for load in dcs_load]
+        self.mss = PSIKMainServerSwitch("mss", mss_dpid, mss_ip, self.dcs_load)
+        print "Data centers loads: " + str(self.dcs_load)
         self.dcs = list()
         i = 1
         for dpid in dcs_dpids:
+            s_loads = dcs_load[i - 1][1]
+            print s_loads
             self.dcs.append(PSIKLearningSwitch("dc" + str(i), dpid))
             i += 1
 
@@ -293,7 +297,9 @@ def launch (mss_dpid = "00-00-00-01-00-00|1", mss_ip = None,
             mcs_dpid = "00-00-00-02-00-00|2",
             dcs_dpids = ["00-00-00-01-01-00|101", "00-00-00-01-02-00|102",
                        "00-00-00-01-03-00|103"],
-            dcs_load=[1.0/3, 1.0/3, 1.0/3]):
+            dcs_load=[(1.0/3, [1.0/3, 1.0/3, 1.0/3]),
+                      (1.0/3, [1.0/3, 1.0/3, 1.0/3]),
+                      (1.0/3, [1.0/3, 1.0/3, 1.0/3])]):
 
     if mss_ip is None:
         mss_ip = IPAddr("10.254.254.254")
