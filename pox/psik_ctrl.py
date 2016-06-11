@@ -200,6 +200,10 @@ class PSIKMainServerSwitch(PSIKARPVisibleSwitch):
                 diff = target - current
                 if diff < 0:
                     diff = 0
+                else:
+                    # add this a litle bit to distinguish between
+                    # to much and perfectly enough
+                    diff += 0.01
 
                 weights.append(diff)
 
