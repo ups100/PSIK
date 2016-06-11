@@ -25,6 +25,7 @@ import pox.lib.util as poxutil                # Various util functions
 import pox.lib.revent as revent               # Event library
 import pox.lib.recoco as recoco               # Multitasking library
 import random
+import copy
 
 class DecisionType:
     DEC_STATIC = 1
@@ -151,11 +152,36 @@ class PSIKARPVisibleSwitch(PSIKLearningSwitch):
 
 
 class PSIKMainServerSwitch(PSIKARPVisibleSwitch):
-    def __init__(self, sid, dpid, ip, dcs_load, srv_loads,  connection = None):
+    # static load balancing
+    BALANCE_STATIC = 0
+    # Dynamic load balancing based on service CPU usage
+    BALANCE_DYNAMIC_SERVICE_CPU = 1
+    # Dynamic load balancing
+    BALANCE_DYNAMIC_SERVICE_NET = 2
+
+    def __init__(self, sid, dpid, ip, dcs_load, srv_loads, balance_type, connection = None):
         super(PSIKMainServerSwitch, self).__init__(sid, dpid, ip, connection)
         self.service_name = "service.psik.com"
         self.dcs_load = dcs_load
         self.srv_loads = srv_loads
+        self.service_load_port = 9999
+
+        self.dcs_active_load = list()
+
+        for load in self.dcs_load:
+            self.dcs_active_load.append(0)
+
+        self.srv_active_loads = list()
+        self.srv_wip_loads = list()
+        self.nservers = 0
+        self.info_received_set = set()
+        for dc in srv_loads:
+            dc_n_servers = len(dc)
+            self.nservers += dc_n_servers
+
+            self.srv_active_loads.append([0]*dc_n_servers)
+            self.srv_wip_loads.append([(0,0)]*dc_n_servers)
+        self.balance_type = balance_type
 
     def set_connection(self, connection):
         msg = of.ofp_flow_mod()
@@ -168,7 +194,15 @@ class PSIKMainServerSwitch(PSIKARPVisibleSwitch):
         super(PSIKMainServerSwitch, self).set_connection(connection)
 
     def _choose_server(self):
-        def weighted_host_choice(weights):
+        def weighted_host_choice(target, current):
+            weights=list()
+            for target, current in zip(target, current):
+                diff = target - current
+                if diff < 0:
+                    diff = 0
+
+                weights.append(diff)
+
             total = sum(weights)
             r = random.uniform(0, total)
 
@@ -181,8 +215,8 @@ class PSIKMainServerSwitch(PSIKARPVisibleSwitch):
                 i += 1
             assert False, "Shouldn't get here"
 
-        dc = weighted_host_choice(self.dcs_load)
-        srv = weighted_host_choice(self.srv_loads[dc])
+        dc = weighted_host_choice(self.dcs_load, self.dcs_active_load)
+        srv = weighted_host_choice(self.srv_loads[dc], self.srv_active_loads[dc])
         ip_str = "10.0." + str(dc + 1) + "." + str(srv + 1)
         return IPAddr(ip_str)
 
@@ -217,6 +251,70 @@ class PSIKMainServerSwitch(PSIKARPVisibleSwitch):
                               _dstip=packet.find('ipv4').srcip, _dsthw=packet.src,
                               _payload=r, out_port=_out_port)
 
+    def _recalculate_load(self):
+        val_index = 0
+        if self.balance_type == PSIKMainServerSwitch.BALANCE_STATIC:
+            return
+        elif self.balance_type == PSIKMainServerSwitch.BALANCE_DYNAMIC_SERVICE_CPU:
+            val_index = 0
+        elif self.balance_type == PSIKMainServerSwitch.BALANCE_DYNAMIC_SERVICE_CPU:
+            val_index = 1
+        else:
+            return
+
+        dc_ind = 0
+        dc_sums = list()
+        # calculate for servers
+        for dc in self.srv_wip_loads:
+            srv_ind = 0
+            dc_sum = 0
+            for srv_data in dc:
+                dc_sum += srv_data[val_index];
+
+            for srv_data in dc:
+                load = 0.0
+                if dc_sum != 0:
+                    load = float(srv_data[val_index])/dc_sum
+                self.srv_active_loads[dc_ind][srv_ind] = load
+                srv_ind += 1
+            dc_sums.append(dc_sum)
+            dc_ind += 1
+
+        # calculate for data centers
+        dc_ind = 0
+        total = sum(dc_sums)
+        for dc in dc_sums:
+            load  = 0.0 if total == 0 else float(dc)/total
+            self.dcs_active_load[dc_ind] = load
+            dc_ind += 1
+
+        log.info("New load: " + str(self.dcs_active_load))
+
+    def _do_service_load_update(self, packet, event):
+        udpp = packet.find('udp')
+        load_data = str(udpp.payload).split(" ")
+        try:
+            cpu_load = int(load_data[0])
+            net_load = int(load_data[1])
+
+            # just to simplify
+            dc = event.port - 2
+            src_ip_str = str(packet.find('ipv4').srcip)
+            srv = int(src_ip_str[src_ip_str.rfind(".") + 1:]) - 1
+
+            self.srv_wip_loads[dc][srv] = tuple((cpu_load, net_load))
+            self.info_received_set.add(src_ip_str)
+            if len(self.info_received_set) == self.nservers:
+                self._recalculate_load()
+                self.info_received_set = set()
+        except IndexError:
+            log.error("Malformed load info received")
+            return
+        except ValueError:
+            log.error("Malformed load info received")
+            return
+         
+        
     def _do_dns_packet(self, packet, event):
         dnsp = packet.find('dns')
 
@@ -246,11 +344,19 @@ class PSIKMainServerSwitch(PSIKARPVisibleSwitch):
     def _handle_PacketIn(self, event):
         packet = event.parsed
 
-        #is this to us?
+        # is this to us?
         if packet.dst == self.my_mac:
             log.debug("We have packet directed to us")
+            if packet.find('udp') is None:
+                self._drop(packet, event.ofp.buffer_id, event.port, 10)
+                return
+            # packet is udp
+            udpp = packet.find('udp')
             if packet.find('dns') is not None:
                 self._do_dns_packet(packet, event)
+            elif udpp.dstport == self.service_load_port:
+                # it's a load update from our service
+                self._do_service_load_update(packet, event)
             else:
                 self._drop(packet, event.ofp.buffer_id, event.port, 10)
         else:
@@ -261,7 +367,7 @@ class PSIKComponent (object):
         self.mcs = PSIKLearningSwitch("mcs", mcs_dpid)
         self.dcs_load = [float(load[0]) for load in dcs_load]
         self.srv_loads = [load[1] for load in dcs_load]
-        self.mss = PSIKMainServerSwitch("mss", mss_dpid, mss_ip, self.dcs_load, self.srv_loads)
+        self.mss = PSIKMainServerSwitch("mss", mss_dpid, mss_ip, self.dcs_load, self.srv_loads, PSIKMainServerSwitch.BALANCE_DYNAMIC_SERVICE_CPU)
         print "Data centers loads: " + str(self.dcs_load)
         self.dcs = list()
         i = 1
