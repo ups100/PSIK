@@ -40,6 +40,9 @@ def add_data_center(nservers, data_center, parent, parent_mac, dns_ip, net):
        srv_mac = parent_mac[:-2] + hex(server + 1)[2:].zfill(2)
        srv = net.addHost(srv_name, ip=srv_ip, netmask=srv_netmask, mac=srv_mac, dns=dns_ip);
        net.addLink(parent, srv);
+       # run our service on all machines
+       srv.cmd("/home/mininet/psik_server.py > /dev/null &")
+
       
 def add_data_centers(data_centers, parent, parent_mac, dns, net):
     for data_center in range(len(data_centers)):
