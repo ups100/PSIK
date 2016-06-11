@@ -47,47 +47,44 @@ class PSIKLearningSwitch(PSIKSwitch):
         super(PSIKLearningSwitch, self).__init__(sid, dpid, connection)
         self.macToPort = {}
 
-    def _handle_PacketIn(self, event):
-        packet = event.parsed
+    def _flood(self, event):
+        msg = of.ofp_packet_out()
+        msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD))
+        msg.data = event.ofp
+        msg.in_port = event.port
+        self.connection.send(msg)
 
-        def flood():
+    def _drop(self, packet, buffer_id, in_port, duration = None):
+        msg = None
+        if duration is not None:
+            if not isinstance(duration, tuple):
+                duration = (duration,duration)
+            msg = of.ofp_flow_mod()
+            msg.match = of.ofp_match.from_packet(packet)
+            msg.idle_timeout = duration[0]
+            msg.hard_timeout = duration[1]
+            msg.buffer_id = buffer_id
+        elif buffer_id is not None:
             msg = of.ofp_packet_out()
-            msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD))
-            msg.data = event.ofp
-            msg.in_port = event.port
-            self.connection.send(msg)
+            msg.buffer_id = buffer_id
+            msg.in_port = in_port
 
-        def drop(duration = None):
-            msg = None
-            if duration is not None:
-                if not isinstance(duration, tuple):
-                    duration = (duration,duration)
-                msg = of.ofp_flow_mod()
-                msg.match = of.ofp_match.from_packet(packet)
-                msg.idle_timeout = duration[0]
-                msg.hard_timeout = duration[1]
-                msg.buffer_id = event.ofp.buffer_id
-            elif event.ofp.buffer_id is not None:
-                msg = of.ofp_packet_out()
-                msg.buffer_id = event.ofp.buffer_id
-                msg.in_port = event.port
+        self.connection.send(msg)
 
-            self.connection.send(msg)
-
-        #here function really starts
+    def _do_normal_packet(self, packet, event):
         self.macToPort[packet.src] = event.port
 
         if packet.dst.is_multicast:
-            flood()
+            self._flood(event)
         elif packet.dst not in self.macToPort:
             log.debug("Route to %s not found flooding" % (packet.dst,))
-            flood()
+            self._flood(event)
         else:
             port = self.macToPort[packet.dst]
             if port == event.port:
                 log.warning("Same port for packet from %s -> %s on %s.%s.  Drop."
                             % (packet.src, packet.dst, dpid_to_str(event.dpid), port))
-                drop(10)
+                self._drop(packet, event.of.buffer_id, event.port, 10)
                 return
 
             log.debug("installing flow for %s.%i -> %s.%i" %
@@ -100,13 +97,62 @@ class PSIKLearningSwitch(PSIKSwitch):
             msg.data = event.ofp
             self.connection.send(msg)
 
-class PSIKMainServerSwitch(PSIKSwitch):
-    def __init__(self, sid, dpid, ip, dcs_load, connection = None):
-        super(PSIKMainServerSwitch, self).__init__(sid, dpid, connection)
-        self.macToPort = {}
+    def _handle_PacketIn(self, event):
+        packet = event.parsed
+        self._do_normal_packet(packet, event)
+
+class PSIKARPVisibleSwitch(PSIKLearningSwitch):
+    def __init__(self, sid, dpid, ip, connection = None):
+        super(PSIKARPVisibleSwitch, self).__init__(sid, dpid, connection)
         mac_raw = 0x0000FFFFFFFFFFFF & dpid
         self.my_mac = EthAddr(hex(mac_raw)[2:].zfill(12))
         self.my_ip = ip
+
+    def _send_ethernet_packet(self, packet_type, _src, _dst, payload, out_port):
+        e = ethernet(type=packet_type, src=_src, dst=_dst)
+        e.set_payload(payload)
+        msg = of.ofp_packet_out()
+        msg.data = e.pack()
+        msg.actions.append(of.ofp_action_output(port = out_port))
+        msg.in_port = of.OFPP_NONE
+        self.connection.send(msg)
+
+    def _send_arp_response_packet(self, arpp, out_port):
+            r = arp()
+            r.hwtype = r.HW_TYPE_ETHERNET
+            r.prototype = r.PROTO_TYPE_IP
+            r.opcode = r.REPLY
+            r.hwdst = arpp.hwsrc
+            r.protodst = arpp.protosrc
+            r.hwsrc = self.my_mac
+            r.protosrc = self.my_ip
+
+            self._send_ethernet_packet(ethernet.ARP_TYPE,
+                                       self.my_mac, arpp.hwsrc,
+                                       r, out_port)
+
+    def _do_arp_packet(self, packet, event):
+        arpp = packet.find('arp')
+
+        if not (arpp.opcode == arpp.REQUEST and arpp.protodst == self.my_ip):
+            self._do_normal_packet(packet, event)
+            return
+
+        log.info("Host %s is looking for us" % (arpp.protosrc,))
+        self._send_arp_response_packet(arpp, event.port)
+
+    def _handle_PacketIn(self, event):
+        packet = event.parsed
+
+        if packet.find('arp') is not None:
+            self._do_arp_packet(packet, event)
+        else:
+            super(PSIKARPVisibleSwitch, self)._handle_PacketIn(event)
+
+
+class PSIKMainServerSwitch(PSIKARPVisibleSwitch):
+    def __init__(self, sid, dpid, ip, dcs_load, connection = None):
+        super(PSIKMainServerSwitch, self).__init__(sid, dpid, ip, connection)
         self.service_name = "service.psik.com"
         self.dcs_load = dcs_load
 
@@ -120,7 +166,7 @@ class PSIKMainServerSwitch(PSIKSwitch):
         connection.send(msg)
         super(PSIKMainServerSwitch, self).set_connection(connection)
 
-    def choose_data_center(self):
+    def _choose_data_center(self):
         def weighted_host_choice():
             total = sum(load for load in self.dcs_load)
             r = random.uniform(0, total)
@@ -136,148 +182,79 @@ class PSIKMainServerSwitch(PSIKSwitch):
 
         dc = weighted_host_choice() + 1
         ip_str = "10.0." + str(dc) + ".1"
-                
+
         return IPAddr(ip_str)
+
+    def _send_ip_packet(self, protocol, dstip, dsthw, payload, _out_port):
+        ipp = ipv4()
+        ipp.protocol = protocol
+        ipp.srcip = self.my_ip
+        ipp.dstip = dstip
+        ipp.set_payload(payload)
+        self._send_ethernet_packet(packet_type=ethernet.IP_TYPE,
+                                   _src=self.my_mac, _dst=dsthw,
+                                   payload=ipp, out_port=_out_port)
+
+    def _send_udp_packet(self, srcport, dstport, _dstip, _dsthw, _payload, out_port):
+        u = udp()
+        u.srcport = srcport
+        u.dstport = dstport
+        u.set_payload(_payload)
+        self._send_ip_packet(protocol=ipv4.UDP_PROTOCOL,
+                             dstip=_dstip, dsthw=_dsthw, payload=u, _out_port=out_port)
+
+    def _send_dns_response_packet(self, packet, dnsp, question, response, _out_port):
+        r = dns()
+        r.id = dnsp.id
+        r.rd = dnsp.rd
+        r.ra = True
+        r.aa = 1
+        r.questions.append(question)
+        r.answers.append(response)
+
+        self._send_udp_packet(srcport=53, dstport=packet.find('udp').srcport,
+                              _dstip=packet.find('ipv4').srcip, _dsthw=packet.src,
+                              _payload=r, out_port=_out_port)
+
+    def _do_dns_packet(self, packet, event):
+        dnsp = packet.find('dns')
+
+        if len(dnsp.questions) > 1:
+            self._drop(packet, event.ofp.buffer_id, event.port)
+            return
+
+        question = dnsp.questions[0]
+        response = None
+        log.debug("Question: %s" % (question.name))
+        if question.qtype == dns.rr.A_TYPE and question.name == self.service_name:
+            # Some one is asking about our service so let's
+            # choose one of data centers and answer him
+            dc_ip = self._choose_data_center()
+            response = dns.rr(question.name, question.qtype, question.qclass,
+                              0, 4, dc_ip)
+        elif question.qtype == dns.rr.PTR_TYPE:
+            # for now we assume that only our dns is resolvable
+            response = dns.rr(question.name, question.qtype, question.qclass,
+                                  0, len(self.service_name), self.service_name)
+        else:
+            self._drop(packet, event.ofp.buffer_id, event.port)
+            return
+
+        self._send_dns_response_packet(packet, dnsp, question, response, event.port)
 
     def _handle_PacketIn(self, event):
         packet = event.parsed
 
-        def drop(duration = None):
-            msg = None
-            if duration is not None:
-                if not isinstance(duration, tuple):
-                    duration = (duration,duration)
-                msg = of.ofp_flow_mod()
-                msg.match = of.ofp_match.from_packet(packet)
-                msg.idle_timeout = duration[0]
-                msg.hard_timeout = duration[1]
-                msg.buffer_id = event.ofp.buffer_id
-            elif event.ofp.buffer_id is not None:
-                msg = of.ofp_packet_out()
-                msg.buffer_id = event.ofp.buffer_id
-                msg.in_port = event.port
-
-            self.connection.send(msg)
-
-        def handle_dns(packet):
-            dnsp = packet.find('dns')
-
-            if len(dnsp.questions) > 1:
-                drop()
-                return
-
-            question = dnsp.questions[0]
-            response = None
-            log.debug("Question: %s" % (question.name))
-            if question.qtype == dns.rr.A_TYPE and question.name == self.service_name:
-                # Some one is asking about our service so let's
-                # choose one of data centers and answer him
-                dc_ip = self.choose_data_center()
-                response = dns.rr(question.name, question.qtype, question.qclass,
-                                  0, 4, dc_ip)
-            elif question.qtype == dns.rr.PTR_TYPE:
-                # for now we assume that only our dns is resolvable
-                response = dns.rr(question.name, question.qtype, question.qclass,
-                                  0, len(self.service_name), self.service_name)
-            else:
-                drop()
-                return
-
-            r = dns()
-            r.id = dnsp.id
-            r.rd = dnsp.rd
-            r.ra = True
-            r.aa = 1
-            r.questions.append(question)
-            r.answers.append(response)
-            u = udp()
-            u.srcport = 53
-            u.dstport = packet.find('udp').srcport
-            u.set_payload(r)
-
-            ipp = ipv4()
-            ipp.protocol = ipv4.UDP_PROTOCOL
-            ipp.srcip = self.my_ip
-            ipp.dstip = packet.find('ipv4').srcip
-            ipp.set_payload(u)
-
-            e = ethernet(type=ethernet.IP_TYPE, src=self.my_mac,
-                         dst=packet.src)
-            e.set_payload(ipp)
-            msg = of.ofp_packet_out()
-            msg.data = e.pack()
-            msg.actions.append(of.ofp_action_output(port = event.port))
-            msg.in_port = of.OFPP_NONE
-            self.connection.send(msg)
-            
-        def send_arp_resonse(arpp):
-            r = arp()
-            r.hwtype = r.HW_TYPE_ETHERNET
-            r.prototype = r.PROTO_TYPE_IP
-            r.opcode = r.REPLY
-            r.hwdst = arpp.hwsrc
-            r.protodst = arpp.protosrc
-            r.hwsrc = self.my_mac
-            r.protosrc = self.my_ip
-            e = ethernet(type=ethernet.ARP_TYPE, src=self.my_mac,
-                         dst=arpp.hwsrc)
-            e.set_payload(r)
-            msg = of.ofp_packet_out()
-            msg.data = e.pack()
-            msg.actions.append(of.ofp_action_output(port = event.port))
-            msg.in_port = of.OFPP_NONE
-            self.connection.send(msg)
-            
-        def handle_normal(packet):
-            def flood():
-                msg = of.ofp_packet_out()
-                msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD))
-                msg.data = event.ofp
-                msg.in_port = event.port
-                self.connection.send(msg)
-
-
-            self.macToPort[packet.src] = event.port
-
-            if packet.dst.is_multicast:
-                flood()
-            elif packet.dst not in self.macToPort:
-                log.debug("Route to %s not found flooding" % (packet.dst,))
-                flood()
-            else:
-                port = self.macToPort[packet.dst]
-                if port == event.port:
-                    log.warning("Same port for packet from %s -> %s on %s.%s.  Drop."
-                                % (packet.src, packet.dst, dpid_to_str(event.dpid), port))
-                    drop(10)
-                    return
-
-                log.debug("installing flow for %s.%i -> %s.%i" %
-                          (packet.src, event.port, packet.dst, port))
-                msg = of.ofp_flow_mod()
-                msg.match = of.ofp_match.from_packet(packet, event.port)
-                msg.idle_timeout = 10
-                msg.hard_timeout = 30
-                msg.actions.append(of.ofp_action_output(port = port))
-                msg.data = event.ofp
-                self.connection.send(msg)
-
         #is this to us?
         if packet.dst == self.my_mac:
-            log.debug("Jest do nas")
+            log.debug("We have packet directed to us")
             if packet.find('dns') is not None:
-                handle_dns(packet)
-        elif packet.find('arp') is not None:
-            arpp = packet.find('arp')
-            # someone is looking for us
-            if arpp.opcode == arpp.REQUEST and arpp.protodst == self.my_ip:
-                log.info("Host %s is looking for us" % (arpp.protosrc,))
-                send_arp_resonse(arpp)
+                self._do_dns_packet(packet, event)
             else:
-                handle_normal(packet)
+                self._drop(packet, event.ofp.buffer_id, event.port, 10)
         else:
-            handle_normal(packet)
-         
+            super(PSIKMainServerSwitch, self)._handle_PacketIn(event)
+
 class PSIKComponent (object):
     def __init__(self, mss_dpid, mss_ip, mcs_dpid, dcs_dpids, decision_type, dcs_load):
         self.switches = set()
@@ -327,4 +304,3 @@ def launch (mss_dpid = "00-00-00-01-00-00|1", mss_ip = None,
         dcs_dpids[i] = poxutil.str_to_dpid(dcs_dpids[i])
 
     core.registerNew(PSIKComponent, mss_dpid, mss_ip, mcs_dpid, dcs_dpids, DecisionType.DEC_STATIC, dcs_load)
-
